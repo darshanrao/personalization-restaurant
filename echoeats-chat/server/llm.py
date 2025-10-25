@@ -5,21 +5,15 @@ from dotenv import load_dotenv
 from langchain_openai import ChatOpenAI
 from langchain_core.messages import HumanMessage, AIMessage, SystemMessage
 from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
-from langchain_core.memory import BaseMemory
 
 # Load environment variables
 load_dotenv()
 
-class SimpleMemory(BaseMemory):
+class SimpleMemory:
     """Simple in-memory storage for chat history."""
     
     def __init__(self):
-        super().__init__()
         self._sessions: Dict[str, List] = {}
-    
-    @property
-    def memory_variables(self) -> List[str]:
-        return ["messages"]
     
     def load_memory_variables(self, inputs: Dict[str, any]) -> Dict[str, any]:
         session_id = inputs.get("session_id", "default")
@@ -83,21 +77,21 @@ class LLMService:
             memory_vars = self.memory.load_memory_variables({"session_id": session_id})
             existing_messages = memory_vars["messages"]
             
-            # Create prompt template
-            prompt = ChatPromptTemplate.from_messages([
-                ("system", "You are a helpful assistant. Be friendly and engaging in your responses."),
-                MessagesPlaceholder(variable_name="chat_history"),
-                ("human", "{input}")
-            ])
+            # Build conversation context manually with explicit memory instructions
+            conversation_context = "You are a helpful assistant. Be friendly and engaging in your responses. IMPORTANT: You must remember and use information from previous messages in this conversation. If someone tells you their name, remember it and use it when asked.\n\n"
             
-            # Create chain
-            chain = prompt | self.model
+            # Add previous conversation history
+            for msg in existing_messages:
+                if isinstance(msg, HumanMessage):
+                    conversation_context += f"Human: {msg.content}\n"
+                elif isinstance(msg, AIMessage):
+                    conversation_context += f"Assistant: {msg.content}\n"
             
-            # Invoke the chain
-            response = chain.invoke({
-                "chat_history": existing_messages,
-                "input": message
-            })
+            # Add current message
+            conversation_context += f"\nHuman: {message}\nAssistant:"
+            
+            # Use simple prompt without MessagesPlaceholder
+            response = self.model.invoke(conversation_context)
             
             # Save to memory
             self.memory.save_context(
