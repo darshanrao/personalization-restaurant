@@ -1,7 +1,15 @@
 'use client';
 
 import { useState, useEffect, useRef } from 'react';
-import { sendChat, getChatHistory, ChatResponse } from '../lib/api';
+import { sendChat, sendVoiceChat, getChatHistory, speechToText, ChatResponse, VoiceChatResponse } from '../lib/api';
+
+// TypeScript declarations for Web Speech API
+declare global {
+  interface Window {
+    SpeechRecognition: any;
+    webkitSpeechRecognition: any;
+  }
+}
 
 interface ChatMessage {
   role: 'user' | 'assistant';
@@ -24,7 +32,14 @@ export default function Home() {
   const [currentSessionId, setCurrentSessionId] = useState<string | null>(null);
   const [isLoading, setIsLoading] = useState(false);
   const [botTyping, setBotTyping] = useState(false);
+  const [isRecording, setIsRecording] = useState(false);
+  const [isPlaying, setIsPlaying] = useState(false);
+  const [voiceMode, setVoiceMode] = useState(false);
+  const [isProcessingSpeech, setIsProcessingSpeech] = useState(false);
+  const [speechError, setSpeechError] = useState<string | null>(null);
   const messagesEndRef = useRef<HTMLDivElement>(null);
+  const mediaRecorderRef = useRef<MediaRecorder | null>(null);
+  const audioRef = useRef<HTMLAudioElement | null>(null);
 
   // Load session ID from localStorage on component mount
   useEffect(() => {
@@ -63,6 +78,219 @@ export default function Home() {
   const generateSessionTitle = (firstMessage: string): string => {
     const words = firstMessage.split(' ').slice(0, 3);
     return words.join(' ').charAt(0).toUpperCase() + words.join(' ').slice(1);
+  };
+
+  const startRecording = async () => {
+    try {
+      const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+      const mediaRecorder = new MediaRecorder(stream);
+      mediaRecorderRef.current = mediaRecorder;
+      
+      const audioChunks: BlobPart[] = [];
+      
+      mediaRecorder.ondataavailable = (event) => {
+        audioChunks.push(event.data);
+      };
+      
+      mediaRecorder.onstop = async () => {
+        const audioBlob = new Blob(audioChunks, { type: 'audio/wav' });
+        await processVoiceMessage(audioBlob);
+        stream.getTracks().forEach(track => track.stop());
+      };
+      
+      mediaRecorder.start();
+      setIsRecording(true);
+    } catch (error) {
+      console.error('Error starting recording:', error);
+    }
+  };
+
+  const stopRecording = () => {
+    if (mediaRecorderRef.current && isRecording) {
+      mediaRecorderRef.current.stop();
+      setIsRecording(false);
+    }
+  };
+
+  const processVoiceMessage = async (audioBlob: Blob) => {
+    setIsProcessingSpeech(true);
+    
+    try {
+      // First try ElevenLabs STT API
+      const response = await speechToText(audioBlob);
+      setIsProcessingSpeech(false);
+      
+      if (response.success && response.text.trim()) {
+        await handleVoiceSubmit(response.text);
+        return;
+      }
+    } catch (error) {
+      console.log('ElevenLabs STT failed, trying Web Speech API:', error);
+    }
+    
+    // Fallback to Web Speech API if ElevenLabs STT fails
+    setIsProcessingSpeech(false);
+    
+    if ('webkitSpeechRecognition' in window || 'SpeechRecognition' in window) {
+      const SpeechRecognition = window.SpeechRecognition || window.webkitSpeechRecognition;
+      const recognition = new SpeechRecognition();
+      
+      recognition.continuous = false;
+      recognition.interimResults = false;
+      recognition.lang = 'en-US';
+      
+      recognition.onresult = async (event) => {
+        const transcript = event.results[0][0].transcript;
+        if (transcript.trim()) {
+          await handleVoiceSubmit(transcript);
+        }
+      };
+      
+      recognition.onerror = (event) => {
+        console.error('Web Speech API error:', event.error);
+        setIsProcessingSpeech(false);
+        
+        // Handle different error types
+        let errorMessage = "Speech recognition failed. What did you say?";
+        
+        switch (event.error) {
+          case 'no-speech':
+            errorMessage = "No speech detected. Please try speaking louder or closer to the microphone. What did you say?";
+            setSpeechError("No speech detected. Try speaking louder.");
+            break;
+          case 'audio-capture':
+            errorMessage = "Microphone access denied. Please allow microphone access and try again. What did you say?";
+            setSpeechError("Microphone access denied.");
+            break;
+          case 'not-allowed':
+            errorMessage = "Microphone permission denied. Please allow microphone access in your browser settings. What did you say?";
+            setSpeechError("Microphone permission denied.");
+            break;
+          case 'network':
+            errorMessage = "Network error occurred. Please check your internet connection. What did you say?";
+            setSpeechError("Network error occurred.");
+            break;
+          default:
+            errorMessage = `Speech recognition error: ${event.error}. What did you say?`;
+            setSpeechError(`Speech error: ${event.error}`);
+        }
+        
+        // Clear error after 3 seconds
+        setTimeout(() => setSpeechError(null), 3000);
+        
+        // Final fallback to manual input
+        const userMessage = prompt(errorMessage);
+        if (userMessage) {
+          handleVoiceSubmit(userMessage);
+        }
+      };
+      
+      recognition.start();
+    } else {
+      // Final fallback for browsers without speech recognition
+      const userMessage = prompt("Speech recognition not supported. What did you say?");
+      if (userMessage) {
+        await handleVoiceSubmit(userMessage);
+      }
+    }
+  };
+
+  const playAudio = (audioBase64: string) => {
+    if (!audioBase64) return;
+    
+    try {
+      const audioBlob = new Blob([
+        Uint8Array.from(atob(audioBase64), c => c.charCodeAt(0))
+      ], { type: 'audio/mpeg' });
+      
+      const audioUrl = URL.createObjectURL(audioBlob);
+      const audio = new Audio(audioUrl);
+      audioRef.current = audio;
+      
+      audio.onplay = () => setIsPlaying(true);
+      audio.onended = () => {
+        setIsPlaying(false);
+        URL.revokeObjectURL(audioUrl);
+      };
+      
+      audio.play();
+    } catch (error) {
+      console.error('Error playing audio:', error);
+    }
+  };
+
+  const handleVoiceSubmit = async (message: string) => {
+    if (!message.trim()) return;
+
+    const currentMessage = message;
+    setMessage('');
+
+    // Add user message to UI immediately
+    const userMessage: ChatMessage = {
+      role: 'user',
+      content: currentMessage,
+      timestamp: new Date()
+    };
+    setMessages(prev => [...prev, userMessage]);
+
+    // Show bot typing
+    setBotTyping(true);
+
+    try {
+      const response: VoiceChatResponse = await sendVoiceChat(currentMessage, currentSessionId || undefined);
+      
+      // Update session ID if this is a new session
+      if (!currentSessionId) {
+        setCurrentSessionId(response.session_id);
+        localStorage.setItem('chatSessionId', response.session_id);
+        
+        // Create new session
+        const newSession: ChatSession = {
+          id: response.session_id,
+          title: generateSessionTitle(currentMessage),
+          lastMessage: currentMessage,
+          timestamp: new Date(),
+          messageCount: response.message_count
+        };
+        setSessions(prev => [newSession, ...prev]);
+      } else {
+        // Update existing session
+        setSessions(prev => prev.map(session => 
+          session.id === currentSessionId 
+            ? { ...session, lastMessage: currentMessage, messageCount: response.message_count }
+            : session
+        ));
+      }
+      
+      // Simulate typing delay
+      setTimeout(() => {
+        setBotTyping(false);
+        
+        // Add assistant response to UI
+        const assistantMessage: ChatMessage = {
+          role: 'assistant',
+          content: response.reply,
+          timestamp: new Date()
+        };
+        setMessages(prev => [...prev, assistantMessage]);
+        
+        // Play audio response
+        if (response.audio) {
+          playAudio(response.audio);
+        }
+      }, Math.min(response.reply.length * 50, 2000));
+      
+    } catch (error) {
+      console.error('Error:', error);
+      setBotTyping(false);
+      
+      const errorMessage: ChatMessage = {
+        role: 'assistant',
+        content: 'Error: Failed to send voice message',
+        timestamp: new Date()
+      };
+      setMessages(prev => [...prev, errorMessage]);
+    }
   };
 
   const handleSubmit = async (e: React.FormEvent) => {
@@ -233,12 +461,26 @@ export default function Home() {
       <div className="flex-1 flex flex-col h-screen">
         {/* Header */}
         <div className="bg-white border-b border-gray-200 px-6 py-4">
-          <h1 className="text-xl font-semibold text-gray-900">EchoEats Assistant</h1>
-          {currentSessionId && (
-            <p className="text-sm text-gray-500 mt-1">
-              Session: {currentSessionId.slice(0, 8)}...
-            </p>
-          )}
+          <div className="flex items-center justify-between">
+            <div>
+              <h1 className="text-xl font-semibold text-gray-900">EchoEats Assistant</h1>
+              {currentSessionId && (
+                <p className="text-sm text-gray-500 mt-1">
+                  Session: {currentSessionId.slice(0, 8)}...
+                </p>
+              )}
+            </div>
+            <button
+              onClick={() => setVoiceMode(!voiceMode)}
+              className={`px-4 py-2 rounded-lg font-medium transition-colors ${
+                voiceMode 
+                  ? 'bg-blue-500 text-white' 
+                  : 'bg-gray-200 text-gray-700 hover:bg-gray-300'
+              }`}
+            >
+              {voiceMode ? '🎤 Voice Mode' : '💬 Text Mode'}
+            </button>
+          </div>
         </div>
 
         {/* Chat Messages */}
@@ -311,8 +553,42 @@ export default function Home() {
             <div ref={messagesEndRef} />
           </div>
 
-          {/* Message Input */}
-          <div className="border-t-2 border-gray-200 px-4 pt-4 mb-2 sm:mb-0">
+        {/* Message Input */}
+        <div className="border-t-2 border-gray-200 px-4 pt-4 mb-2 sm:mb-0">
+          {voiceMode ? (
+            /* Voice Input */
+            <div className="flex items-center justify-center space-x-4">
+              <button
+                onClick={isRecording ? stopRecording : startRecording}
+                disabled={isProcessingSpeech}
+                className={`px-6 py-3 rounded-full font-medium transition-all ${
+                  isRecording 
+                    ? 'bg-red-500 text-white animate-pulse' 
+                    : isProcessingSpeech
+                    ? 'bg-yellow-500 text-white cursor-not-allowed'
+                    : 'bg-blue-500 text-white hover:bg-blue-600'
+                }`}
+              >
+                {isRecording 
+                  ? '🛑 Stop Recording' 
+                  : isProcessingSpeech 
+                  ? '🔄 Processing Speech...' 
+                  : '🎤 Start Recording'
+                }
+              </button>
+              {isPlaying && (
+                <div className="flex items-center text-blue-500">
+                  <div className="animate-pulse">🔊 Playing response...</div>
+                </div>
+              )}
+              {speechError && (
+                <div className="flex items-center text-red-500">
+                  <div className="text-sm">⚠️ {speechError}</div>
+                </div>
+              )}
+            </div>
+          ) : (
+            /* Text Input */
             <div className="relative flex">
               <input 
                 type="text" 
@@ -344,7 +620,8 @@ export default function Home() {
                 </button>
               </div>
             </div>
-          </div>
+          )}
+        </div>
         </div>
       </div>
     </div>
