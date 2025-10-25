@@ -1,10 +1,13 @@
 import os
 import uuid
+import json
+import re
 from typing import Dict, List, Optional
 from dotenv import load_dotenv
 from langchain_openai import ChatOpenAI
 from langchain_core.messages import HumanMessage, AIMessage, SystemMessage
 from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
+from order_tool import ORDER_TOOLS
 
 # Load environment variables
 load_dotenv()
@@ -44,6 +47,7 @@ class LLMService:
         
         # Initialize ChatOpenAI if credentials are available
         self.model = None
+        self.model_with_tools = None
         self.memory = SimpleMemory()
         
         if self.api_key and self.api_base and self.model_name:
@@ -54,14 +58,18 @@ class LLMService:
                     api_key=self.api_key,
                     temperature=0.7
                 )
+                # Bind tools to the model
+                self.model_with_tools = self.model.bind_tools(ORDER_TOOLS)
                 print(f"Successfully initialized LangChain with model: {self.model_name}")
+                print(f"Bound {len(ORDER_TOOLS)} tools to the model")
             except Exception as e:
                 print(f"Failed to initialize LangChain: {e}")
                 self.model = None
+                self.model_with_tools = None
 
     async def chat_once(self, message: str, session_id: Optional[str] = None) -> Dict:
         """Send a message to the LLM and return the response with session info."""
-        if not self.model:
+        if not self.model_with_tools:
             return {
                 "reply": f"echo: {message}",
                 "session_id": session_id or str(uuid.uuid4()),
@@ -77,26 +85,52 @@ class LLMService:
             memory_vars = self.memory.load_memory_variables({"session_id": session_id})
             existing_messages = memory_vars["messages"]
             
-            # Build conversation context manually with explicit memory instructions
-            conversation_context = "You are a helpful assistant. Be friendly and engaging in your responses. IMPORTANT: You must remember and use information from previous messages in this conversation. If someone tells you their name, remember it and use it when asked.\n\n"
+            # Create conversation messages
+            messages = [
+                SystemMessage(content="You are a helpful assistant for EchoEats restaurant. Be friendly and engaging in your responses. You have access to order search tools to help customers find their previous orders. Use these tools when customers ask about their order history.")
+            ]
             
-            # Add previous conversation history
-            for msg in existing_messages:
-                if isinstance(msg, HumanMessage):
-                    conversation_context += f"Human: {msg.content}\n"
-                elif isinstance(msg, AIMessage):
-                    conversation_context += f"Assistant: {msg.content}\n"
+            # Add conversation history
+            messages.extend(existing_messages)
             
-            # Add current message
-            conversation_context += f"\nHuman: {message}\nAssistant:"
+            # Add current user message
+            messages.append(HumanMessage(content=message))
             
-            # Use simple prompt without MessagesPlaceholder
-            response = self.model.invoke(conversation_context)
+            # Get response from model with tools
+            response = self.model_with_tools.invoke(messages)
+            
+            # Check if the model wants to call tools
+            if hasattr(response, 'tool_calls') and response.tool_calls:
+                # Execute tool calls
+                tool_results = []
+                for tool_call in response.tool_calls:
+                    tool_name = tool_call['name']
+                    tool_args = tool_call['args']
+                    
+                    # Find and execute the tool
+                    for tool in ORDER_TOOLS:
+                        if tool.name == tool_name:
+                            try:
+                                result = tool.invoke(tool_args)
+                                tool_results.append(f"Tool {tool_name}: {result}")
+                            except Exception as e:
+                                tool_results.append(f"Tool {tool_name} error: {str(e)}")
+                            break
+                
+                # Create a new message with tool results
+                tool_message = AIMessage(content=f"Tool results: {'; '.join(tool_results)}")
+                messages.append(tool_message)
+                
+                # Get final response
+                final_response = self.model_with_tools.invoke(messages)
+                final_content = final_response.content
+            else:
+                final_content = response.content
             
             # Save to memory
             self.memory.save_context(
                 {"message": message, "session_id": session_id},
-                {"reply": response.content}
+                {"reply": final_content}
             )
             
             # Get updated message count
@@ -104,7 +138,7 @@ class LLMService:
             message_count = len(updated_memory["messages"])
             
             return {
-                "reply": response.content,
+                "reply": final_content,
                 "session_id": session_id,
                 "message_count": message_count
             }
@@ -116,6 +150,7 @@ class LLMService:
                 "session_id": session_id,
                 "message_count": 0
             }
+    
 
     def get_chat_history(self, session_id: str) -> List[Dict]:
         """Get chat history for a specific session."""
